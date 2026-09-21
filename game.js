@@ -60,6 +60,7 @@ function makeUnit(t) {
     y: t.y
   };
 }
+
 function cell(x,y) { return x>=0 && y>=0 && x<SIZE && y<SIZE ? board[y][x] : null; }
 function at(x,y) { return state.units.find(u=>u.alive && u.x===x && u.y===y); }
 function currentUnit() { return state.turnOrder[state.turnIndex] || null; }
@@ -67,8 +68,8 @@ function distance(a,b) { return Math.max(Math.abs(a.x-b.x),Math.abs(a.y-b.y)); }
 function log(text) { state.log.unshift(text); state.log = state.log.slice(0,18); }
 
 function setupMap() {
-  board = Array.from({length:SIZE},()=>Array.from({length:SIZE},()=>({type:"floor",walk:true,los:false})));
-  const set=(x,y,type)=>{const c=cell(x,y);if(!c)return;c.type=type;c.walk=!['wall','container','vehicle'].includes(type);c.los=['wall','container'].includes(type);};
+  board = Array.from({length:SIZE},()=>Array.from({length:SIZE},()=>({type:"floor",walk:true,los:false,cover:0})));
+  const set=(x,y,type)=>{const c=cell(x,y);if(!c)return;c.type=type;c.walk=!['wall','container','vehicle'].includes(type);c.los=['wall','container'].includes(type);c.cover = type === 'tree' ? 1 : type === 'wall' || type === 'container' ? 2 : 0;};
   for(let i=0;i<SIZE;i++){set(i,0,"wall");set(i,19,"wall");set(0,i,"wall");set(19,i,"wall");}
   [[4,4],[5,4],[6,4],[4,5],[6,5],[4,6],[5,6],[6,6],[10,10],[11,10],[12,10],[11,11],[12,11],[13,11],[10,12],[11,12],[12,12]].forEach(p=>set(p[0],p[1],"wall"));
   [[3,2],[12,2],[3,3],[12,3],[8,8],[9,8],[10,8],[16,12],[16,13]].forEach(p=>set(p[0],p[1],"container"));
@@ -141,6 +142,50 @@ function lineOfSight(a,b) {
   }
   return true;
 }
+
+function getCoverBonus(target) {
+  const c = cell(target.x, target.y);
+  if (!c) return 0;
+  if (c.cover === 1) return 4;
+  if (c.cover === 2) return 8;
+  return 0;
+}
+
+function calculateHit(attacker, target) {
+  const base = attacker.attack + Math.floor(Math.random() * 6);
+  const defense = (target.defense || 0) + getCoverBonus(target);
+  return base - defense;
+}
+
+function applyKnockback(target, source, force) {
+  if (!target || !source || force <= 0) return;
+  const dx = Math.sign(target.x - source.x) || 0;
+  const dy = Math.sign(target.y - source.y) || 0;
+  for (let i=0;i<force;i++) {
+    const nx = target.x + dx;
+    const ny = target.y + dy;
+    const next = cell(nx, ny);
+    if (!next || !next.walk) {
+      damage({name:"Kollision"}, target, 8);
+      break;
+    }
+    const blocker = at(nx, ny);
+    if (blocker && blocker.id !== target.id) {
+      damage({name:"Kollision"}, target, 6);
+      if (blocker.alive) damage({name:"Kollision"}, blocker, 6);
+      break;
+    }
+    target.x = nx;
+    target.y = ny;
+  }
+}
+
+function knockdownCheck(target, force) {
+  if (!target || !target.alive) return false;
+  const threshold = target.stability || 20;
+  return force > threshold;
+}
+
 function targets(u) {
   return state.units.filter(t=>t.alive && t.team !== u.team && distance(u,t) <= u.range && lineOfSight(u,t));
 }
@@ -152,6 +197,7 @@ function moveUnit(x,y) {
   const d = Math.abs(u.x-x) + Math.abs(u.y-y);
   u.x = x; u.y = y; u.moveLeft -= d; spend(u); state.mode = "move"; state.highlight = reachable(u); render();
 }
+
 function damage(attacker,target,amount) {
   if (!target || !target.alive) return;
   const value = Math.max(1, amount - (target.defense || 0));
@@ -163,26 +209,29 @@ function damage(attacker,target,amount) {
     log(`${target.name} ist kampfunfähig.`);
   }
 }
-function knockback(target,source,force) {
-  if (!target || !source || !target.alive) return;
-  const dx = Math.sign(target.x - source.x) || 0;
-  const dy = Math.sign(target.y - source.y) || 0;
-  for (let i=0;i<force;i++) {
-    const x = target.x + dx;
-    const y = target.y + dy;
-    const c = cell(x,y);
-    if (!c || !c.walk) { damage({name:"Kollision"}, target, 8); break; }
-    if (at(x,y) && at(x,y).id !== target.id) { damage({name:"Kollision"}, target, 6); break; }
-    target.x = x; target.y = y;
-  }
-}
+
 function attack(target) {
   const u = currentUnit();
-  if (!isCurrent(u) || u.ap < 1 || !target || target.team === u.team || distance(u,target) > u.range || !lineOfSight(u,target)) return;
-  damage(u,target,u.attack + 5);
-  if (u.knockback) knockback(target,u,u.knockback);
+  if (!isCurrent(u) || u.ap < 1 || !target || target.team === u.team) return;
+  if (distance(u,target) > u.range) return;
+  if (!lineOfSight(u,target)) return;
+  const hit = calculateHit(u, target);
+  if (hit <= 0) {
+    log(`${u.name} verfehlt ${target.name}.`);
+    spend(u); state.mode = null; state.highlight = []; render();
+    return;
+  }
+  damage(u, target, u.attack + 5);
+  if (u.knockback && target.alive) {
+    applyKnockback(target, u, u.knockback);
+    if (knockdownCheck(target, u.knockback)) {
+      target.statuses.push("knocked_down");
+      log(`${target.name} wird umgeworfen.`);
+    }
+  }
   spend(u); state.mode = null; state.highlight = []; checkMission(); render();
 }
+
 function useAbility(target) {
   const u = currentUnit();
   if (!isCurrent(u) || u.ap < 1) return;
@@ -192,11 +241,25 @@ function useAbility(target) {
     log(`${u.name} heilt ${target.name} um ${u.heal}.`);
   } else {
     if (!target || target.team === u.team || distance(u,target) > u.range) return;
+    if (!lineOfSight(u,target)) return;
+    const hit = calculateHit(u, target);
+    if (hit <= 0) {
+      log(`${u.name} verfehlt ${target.name}.`);
+      spend(u); state.mode = null; state.highlight = []; render();
+      return;
+    }
     damage(u,target,u.damage);
-    if (u.knockback && target.alive) knockback(target,u,u.knockback);
+    if (u.knockback && target.alive) {
+      applyKnockback(target, u, u.knockback);
+      if (knockdownCheck(target, u.knockback)) {
+        target.statuses.push("knocked_down");
+        log(`${target.name} wird umgeworfen.`);
+      }
+    }
   }
   spend(u); state.mode = null; state.highlight = []; render();
 }
+
 function endTurn() {
   const u = currentUnit();
   if (!u || state.victory || state.defeat) return;
@@ -206,6 +269,7 @@ function endTurn() {
   checkMission();
   render();
 }
+
 function checkMission(){
   if (!state.units.some(u=>u.alive && u.team === "hero")) state.defeat = true;
   if (state.core && !state.core.alive) state.victory = true;
@@ -219,9 +283,12 @@ function tileClick(x,y) {
   if (state.mode === "attack") {
     if (target) attack(target);
     else if (state.core && state.core.alive && state.core.x === x && state.core.y === y && distance(u,state.core) <= u.range) {
-      damage(u, state.core, u.attack + 5);
-      if (state.core.hp <= 0) state.core.alive = false;
-      spend(u); state.mode = null; state.highlight = []; render();
+      const hit = calculateHit(u, state.core);
+      if (hit > 0) {
+        damage(u, state.core, u.attack + 5);
+        if (state.core.hp <= 0) state.core.alive = false;
+        spend(u); state.mode = null; state.highlight = []; render();
+      }
     }
     return;
   }
